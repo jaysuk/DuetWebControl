@@ -350,3 +350,50 @@ Also found while re-reading this file with fresh eyes, **not yet fixed**:
   publish` under the `@duet3d` scope (is that scope actually owned by the Duet3D org?) vs. a
   pinned git-URL dependency.
 - Nothing in this repo (`DuetWebControl`) has been committed yet, including this `enableWasmProcessing()` fix.
+
+## Session update (2026-07-08, continued): dead controls built, both repos committed, Phase 7
+
+**`transparencyPercent`/`useSpecularColor` are no longer dead controls.** Built real fork support
+rather than hiding the UI: `LineShaderMaterial` gained a `ghostAlpha` uniform (replaces the
+hardcoded `0.05` not-yet-printed alpha, now driven by `transparencyPercent`'s 1-100 slider,
+independent of `alphaMode`'s own boolean ghosting toggle) and a `useSpecular` uniform (a
+Blinn-Phong specular highlight term added to the existing ambient+diffuse lighting model, gated
+off by default so it's a no-op unless enabled). Both wired end-to-end
+(`Processor`/`Viewer`/`ViewerApi`/`ViewerProxy`/`ViewerDirect`/worker) and into `GCodeViewer.vue`'s
+`onMounted` seed calls + `watch()` handlers, replacing the two no-op watchers. Verified in a real
+browser: `vue-tsc`/`tsc` clean, and a Playwright screenshot comparison showed a visible color shift
+when toggling `useSpecular` and the ghost-alpha branch correctly engaging (previously-discarded
+not-yet-printed geometry became visible once `alphaMode` + a ghost alpha were both set).
+`setCursorVisiblity`→`toggleNozzle` remains an open, unverified mapping (unchanged).
+
+**Both repos committed**: `gcodeviewer` at `b2e4373` (shader controls, on top of the parity work at
+`dc428a8`), `DuetWebControl` at `e93a8b43` on the `gcodeviewer-fork-integration` branch (everything
+in this plan: the GCodeViewer.vue rewrite, Babylon 9.x bump, `enableWasmProcessing()` fix,
+GCodeViewerForkTest harness). Neither has been pushed to any remote.
+
+**Phase 7, partially done:**
+- **Leak check**: 20 construct→init→enableWasmProcessing→loadFile→unload cycles in a real Edge
+  browser (`--js-flags=--expose-gc`, explicit `window.gc()` between cycles). JS heap plateaued at
+  ~79.3-79.7MB across all 20 cycles - no meaningful growth, confirming `unload()` actually releases
+  the worker/Babylon/WASM instance (the Phase 3 fix holds up under repetition, not just a single
+  mount/unmount).
+- **Performance vs. the fork's own TS-only path**: a synthetic 500,000-line file (`benchmark-test.ts`'s
+  `runBenchmark`) gave a genuinely surprising result - **total wall-clock `loadFile()` time was
+  nearly identical**, TS-only 7,805ms vs. WASM-hybrid 7,787ms (within 0.25%), even though the raw
+  WASM parse itself is fast (~2,805ms parse time out of WASM's 5,775ms total). The bottleneck for
+  this synthetic all-G1 file is mesh/render-buffer generation in the worker, which both paths share
+  - parsing speed alone isn't the dominant cost once you account for the whole pipeline. **This is
+  worth knowing before advertising the WASM path as a strict speed win**: it's real (confirmed
+  ~178,000-189,000 raw parse lines/sec in earlier tests) but its share of total load time on this
+  shape of file is smaller than expected. A file with heavier per-line parsing cost (many slicer
+  comments, arcs, or workplace/belt math) would likely show a larger gap - not tested here.
+- **Performance vs. `@sindarius/gcodeviewer`**: **not done, and not practical right now** - the old
+  package was already fully removed from `package.json` in this same integration, and its source
+  was never available locally (only a published `dist/`, per the original gap-inventory notes).
+  Reinstalling it purely to benchmark would reintroduce the Babylon 7-vs-9 conflict this
+  integration deliberately resolved. If this comparison is still wanted, it needs a separate
+  throwaway checkout/branch with the old dependency restored, not a change to this branch.
+- **Cross-browser/mobile check**: **not done** - this environment only has a real installed
+  Microsoft Edge (Chromium) available to Playwright. No mobile Safari, no other engine. Everything
+  in this plan (including today's WASM-activation and leak verification) has only ever been
+  exercised on desktop Chromium/Edge.
