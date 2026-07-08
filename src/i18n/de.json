@@ -1452,12 +1452,7 @@
 				"caption": "Darstellungsqualität",
 				"title": "Darstellungsqualität der Ansicht anpassen. Je höher die Stufe desto mehr Details werden angezeigt"
 			},
-			"sbc": "SBC",
-			"low": "Niedrig",
-			"medium": "Mittel",
-			"high": "Hoch",
-			"ultra": "Ultra",
-			"max": "Max",
+			"maxFps": "Maximale Bildrate (FPS)",
 			"useHQRendering": "HQ-Rendering (rund)",
 			"useSpecular": "Spiegelndes Highlighting",
 			"feature": "Feature",

@@ -1454,12 +1454,7 @@
 				"caption": "Render Quality",
 				"title": "Adjust the visualization quality of the viewer. The higher the level the more vertices and render modes become available"
 			},
-			"sbc": "SBC",
-			"low": "Low",
-			"medium": "Medium",
-			"high": "High",
-			"ultra": "Ultra",
-			"max": "Max",
+			"maxFps": "Max Frame Rate (FPS)",
 			"forceLineRendering": "Force Line Rendering",
 			"transparency": "Transparency",
 			"extruders": {

@@ -1,0 +1,6 @@
+{
+	"id": "GCodeViewerForkTest",
+	"name": "GCode Viewer Fork Smoke Test",
+	"author": "integration-check",
+	"version": "auto"
+}

@@ -309,10 +309,10 @@
 						</v-expansion-panel-title>
 						<v-expansion-panel-text eager>
 							<div class="d-flex flex-column ga-3">
-								<v-select v-model="renderQuality" :items="renderQualityItems"
-										  :label="$t('plugins.gcodeViewer.renderQuality.caption')"
-										  :disabled="loading" density="compact" variant="outlined"
-										  hide-details />
+								<div>
+									<div class="text-title-small mb-1">{{ $t("plugins.gcodeViewer.maxFps") }}</div>
+									<v-slider v-model="maxFps" :max="60" :min="5" :step="5" thumb-label hide-details />
+								</div>
 								<div class="d-flex flex-column">
 									<v-checkbox v-model="useHQRendering" :label="$t('plugins.gcodeViewer.useHQRendering')"
 												color="primary" hide-details />
@@ -534,11 +534,9 @@
 </template>
 
 <script setup lang="ts">
-import { type Axis, type Job, KinematicsName, type Move, type State } from "@duet3d/objectmodel";
-import { Vector3 } from "@babylonjs/core/Maths/math";
+import { type Job, KinematicsName, type Move, type State } from "@duet3d/objectmodel";
 import { useDisplay } from "vuetify";
-// @ts-ignore - third-party package without bundled types
-import gcodeViewer from "@sindarius/gcodeviewer";
+import { Viewer_Proxy, type LoadFileResult } from "@duet3d/gcodeviewer";
 
 import CodeButton from "@/components/buttons/CodeButton.vue";
 import i18n from "@/i18n";
@@ -559,11 +557,6 @@ interface ObjectInfo {
 	name?: string;
 }
 
-interface PrintBounds {
-	min: Vector3;
-	max: Vector3;
-}
-
 const machineStore = useMachineStore();
 const cacheStore = useCacheStore();
 const settingsStore = useSettingsStore();
@@ -577,7 +570,7 @@ const isEmbedded = computed(() => !route.path.startsWith("/Plugins/GCodeViewer")
 
 // Intentionally module-scope (not a ref) - Babylon's internals don't survive Vue's reactive
 // proxy walk; the template never reads `viewer` directly so losing reactivity is safe
-let viewer: any = null;
+let viewer: Viewer_Proxy | null = null;
 
 const primaryContainer = ref<HTMLElement | null>(null);
 const viewerCanvas = ref<HTMLCanvasElement | null>(null);
@@ -588,21 +581,15 @@ const drawer = ref(false);
 // reset/reload/load buttons + the toggles a user most often reaches for
 const openDrawerPanel = ref<string>("view");
 
-const renderQualityItems = computed(() => [
-	{ title: i18n.global.t("plugins.gcodeViewer.sbc"),    value: 1 },
-	{ title: i18n.global.t("plugins.gcodeViewer.low"),    value: 2 },
-	{ title: i18n.global.t("plugins.gcodeViewer.medium"), value: 3 },
-	{ title: i18n.global.t("plugins.gcodeViewer.high"),   value: 4 },
-	{ title: i18n.global.t("plugins.gcodeViewer.ultra"),  value: 5 },
-	{ title: i18n.global.t("plugins.gcodeViewer.max"),    value: 6 },
-]);
 const backgroundColor = ref("#000000FF");
 const progressColor = ref("#FFFFFFFF");
 const loading = ref(false);
 const showTravelLines = ref(false);
 const persistTravels = ref(false);
 const selectedFile = ref("");
-const renderQuality = ref(1);
+// Direct control over the fork's actual render-cost knob, replacing the old 1-6 preset that never
+// mapped to anything the fork exposes
+const maxFps = ref(30);
 const maxHeight = ref(0);
 const minHeight = ref(0);
 const sliderHeight = ref(0);
@@ -619,7 +606,9 @@ const bedRenderMode = ref(0);
 const showAxes = ref(true);
 const showObjectLabels = ref(true);
 const fullscreen = ref(false);
-const bedColor = ref("");
+// Matches Bed's own default (src/Renderables/bed.ts in the fork) - the fork has no getter for
+// this, so rather than reading its default back on mount, this is pushed to the viewer instead
+const bedColor = ref("#0000FF");
 const colorMode = ref(0);
 const minColorRate = ref(20);
 const maxColorRate = ref(60);
@@ -715,9 +704,9 @@ const viewGCode = computed<boolean>({
 	get: () => pluginCache.value?.viewGCode ?? false,
 	set: (value) => {
 		cacheStore.setPluginData("GCodeViewer", "viewGCode", value);
-		if (viewer) {
-			fileData.value = value ? viewer.fileData : "";
-		}
+		// fileData is kept populated regardless of viewGCode's state (see the various load call
+		// sites) - the fork has no cached copy of the raw text to pull from like the old package
+		// did, so toggling this on only works if DWC already held onto the text itself
 		resize();
 	},
 });
@@ -788,19 +777,21 @@ async function loadSdFile(path: string) {
 		return;
 	}
 	try {
-		const blob = await machineStore.download({
+		const fileText = await machineStore.download({
 			filename: Path.combine(path),
 			type: "text",
 		}, false, false, false);
 		loading.value = true;
 		preLoadSettings();
-		await viewer.processFile(blob);
-		if (viewGCode.value) {
-			fileData.value = viewer.fileData;
+		const result = await viewer.loadFile(fileText);
+		if (result.failed) {
+			uiStore.makeNotification(LogLevel.warning,
+				i18n.global.t("plugins.gcodeViewer.caption"),
+				i18n.global.t("plugins.gcodeViewer.renderFailed"), 5000);
 		}
-		scrubFileSize.value = viewer.fileSize;
-		viewer.gcodeProcessor.setLiveTracking(false);
-		setGCodeValues();
+		fileData.value = fileText;
+		scrubFileSize.value = result.end;
+		setGCodeValues(result);
 		applyDefaultOrientation();
 	} finally {
 		loading.value = false;
@@ -836,178 +827,12 @@ function loadFromRoute() {
 // Default camera placement: a front view tilted 45 deg down. For an ArcRotateCamera alpha -PI/2
 // faces the front edge and beta PI/4 is the tilt. In the embedded Job Status tab the look-at point
 // and orbit radius frame the printed geometry; the standalone page keeps the whole-bed framing
+// The actual framing math now lives in the fork (Viewer.frameToContent(), ported near-verbatim
+// from what used to be here) - it needs the real camera/engine, which only exist inside the
+// worker now. This just forwards the one piece of state the fork can't know on its own: whether
+// this instance is embedded (Job Status tab, frames the print) or standalone (frames the bed).
 function applyDefaultOrientation() {
-	const camera = viewer?.scene?.activeCamera;
-	if (!camera) {
-		return;
-	}
-	const bounds = isEmbedded.value ? getPrintBounds() : null;
-	if (bounds) {
-		camera.target = new Vector3((bounds.min.x + bounds.max.x) / 2, (bounds.min.y + bounds.max.y) / 2,
-			(bounds.min.z + bounds.max.z) / 2);
-	} else {
-		const center = viewer.bed.getCenter();
-		camera.target = new Vector3(center.x, -2, center.y);
-	}
-	camera.alpha = -Math.PI / 2;
-	camera.beta = Math.PI / 4;
-	frameToViewport(framingCorners(bounds));
-	viewer.scene.render(true);
-}
-
-// Axis-aligned bounding box of every extruding move in the loaded file, in Babylon space (x = X,
-// y = print height, z = Y). Returns null when nothing extruding has been parsed yet, so callers
-// fall back to framing the bed. Walked once per load / reset (never per frame), so the linear scan
-// over all rendered segments is cheap relative to the parse that just produced them
-function getPrintBounds(): PrintBounds | null {
-	const lines = viewer?.gcodeProcessor?.renderedLines as
-		Array<{ start: Vector3; end: Vector3; extruding: boolean }> | undefined;
-	if (!lines || lines.length === 0) {
-		return null;
-	}
-	let minX = Infinity, minY = Infinity, minZ = Infinity;
-	let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-	for (const line of lines) {
-		if (!line.extruding) {
-			continue;
-		}
-		minX = Math.min(minX, line.start.x, line.end.x); maxX = Math.max(maxX, line.start.x, line.end.x);
-		minY = Math.min(minY, line.start.y, line.end.y); maxY = Math.max(maxY, line.start.y, line.end.y);
-		minZ = Math.min(minZ, line.start.z, line.end.z); maxZ = Math.max(maxZ, line.start.z, line.end.z);
-	}
-	if (!Number.isFinite(minX)) {
-		return null;
-	}
-	return { min: new Vector3(minX, minY, minZ), max: new Vector3(maxX, maxY, maxZ) };
-}
-
-// Corners fed to the framing fit: the eight corners of the print bounding box, or - with nothing
-// loaded - the four bed-footprint corners on the bed plane. All in Babylon space (y is height)
-function framingCorners(bounds: PrintBounds | null): Array<[number, number, number]> {
-	if (bounds) {
-		const lo = bounds.min, hi = bounds.max;
-		return [
-			[lo.x, lo.y, lo.z], [hi.x, lo.y, lo.z], [lo.x, lo.y, hi.z], [hi.x, lo.y, hi.z],
-			[lo.x, hi.y, lo.z], [hi.x, hi.y, lo.z], [lo.x, hi.y, hi.z], [hi.x, hi.y, hi.z],
-		];
-	}
-	const center = viewer.bed.getCenter();
-	const size = viewer.bed.getSize();
-	const hx = size.x / 2, hy = size.y / 2;
-	return [
-		[center.x - hx, -2, center.y - hy], [center.x + hx, -2, center.y - hy],
-		[center.x - hx, -2, center.y + hy], [center.x + hx, -2, center.y + hy],
-	];
-}
-
-// Pull the orbit camera back until the supplied bounding-box corners fill the viewport. Each corner
-// is projected with the live view + projection matrices and the radius is rescaled from how much of
-// the clip volume they span, so the fit adapts to the box size, the camera tilt and the viewport
-// aspect ratio. A strip is reserved at the bottom so the playback controls stay clear. Perspective
-// makes a single pass approximate, hence the short converging loops
-function frameToViewport(corners: Array<[number, number, number]>) {
-	const camera = viewer?.scene?.activeCamera;
-	if (!camera || corners.length === 0) {
-		return;
-	}
-
-	let spanMinX = Infinity, spanMaxX = -Infinity;
-	let spanMinY = Infinity, spanMaxY = -Infinity;
-	let spanMinZ = Infinity, spanMaxZ = -Infinity;
-	for (const [x, y, z] of corners) {
-		spanMinX = Math.min(spanMinX, x); spanMaxX = Math.max(spanMaxX, x);
-		spanMinY = Math.min(spanMinY, y); spanMaxY = Math.max(spanMaxY, y);
-		spanMinZ = Math.min(spanMinZ, z); spanMaxZ = Math.max(spanMaxZ, z);
-	}
-	const maxSpan = Math.max(spanMaxX - spanMinX, spanMaxY - spanMinY, spanMaxZ - spanMinZ, 1);
-
-	// Before the canvas has a real size the projection matrix is degenerate; fall back to a
-	// rough radius and let the next call (after layout / a file load) frame it properly
-	const engine = viewer.scene.getEngine();
-	if (engine.getRenderWidth() < 1 || engine.getRenderHeight() < 1) {
-		camera.radius = 2 * maxSpan;
-		return;
-	}
-
-	// Start far enough back that every corner is in front of the camera on the first pass
-	camera.radius = 2 * maxSpan;
-
-	// Zoom so the box fills 95% of the viewport width or 74% of its height, whichever binds
-	// first - the rest stays as breathing room
-	const targetX = 0.95;
-	const targetY = 0.74;
-	for (let pass = 0; pass < 8; pass++) {
-		const view = camera.getViewMatrix(true).m as Float32Array;
-		const proj = camera.getProjectionMatrix(true).m as Float32Array;
-		let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, behind = false;
-		for (const [x, y, z] of corners) {
-			// World -> view space (the view matrix is affine, so w stays 1)
-			const vx = view[0] * x + view[4] * y + view[8] * z + view[12];
-			const vy = view[1] * x + view[5] * y + view[9] * z + view[13];
-			const vz = view[2] * x + view[6] * y + view[10] * z + view[14];
-			// View -> clip space
-			const cw = proj[3] * vx + proj[7] * vy + proj[11] * vz + proj[15];
-			if (cw <= 0) {
-				behind = true;
-				break;
-			}
-			const ndcX = (proj[0] * vx + proj[4] * vy + proj[8] * vz + proj[12]) / cw;
-			const ndcY = (proj[1] * vx + proj[5] * vy + proj[9] * vz + proj[13]) / cw;
-			minX = Math.min(minX, ndcX); maxX = Math.max(maxX, ndcX);
-			minY = Math.min(minY, ndcY); maxY = Math.max(maxY, ndcY);
-		}
-		if (behind || !Number.isFinite(minX)) {
-			camera.radius *= 2;
-			continue;
-		}
-		// The visible clip range is [-1, 1] on each axis. Rescale by whichever axis overshoots
-		// its target fill fraction the most
-		const xFill = (maxX - minX) / 2;
-		const yFill = (maxY - minY) / 2;
-		if (xFill <= 0 && yFill <= 0) {
-			break;
-		}
-		const nextRadius = camera.radius * Math.max(xFill / targetX, yFill / targetY);
-		const converged = Math.abs(nextRadius - camera.radius) < camera.radius * 0.01;
-		camera.radius = nextRadius;
-		if (converged) {
-			break;
-		}
-	}
-
-	// Centre the box vertically between the top of the playback controls overlay and the top of
-	// the viewport - clip-space y +0.1 is the midpoint of that band. Perspective skews the
-	// projected box, so the look-at point is nudged until the box centre lands; damped empirical
-	// steps converge without depending on the exact FOV
-	const desiredCenter = 0.1;
-	for (let pass = 0; pass < 6; pass++) {
-		const view = camera.getViewMatrix(true).m as Float32Array;
-		const proj = camera.getProjectionMatrix(true).m as Float32Array;
-		let minY = Infinity, maxY = -Infinity;
-		for (const [x, y, z] of corners) {
-			const vx = view[0] * x + view[4] * y + view[8] * z + view[12];
-			const vy = view[1] * x + view[5] * y + view[9] * z + view[13];
-			const vz = view[2] * x + view[6] * y + view[10] * z + view[14];
-			const cw = proj[3] * vx + proj[7] * vy + proj[11] * vz + proj[15];
-			if (cw <= 0) {
-				continue;
-			}
-			const ndcY = (proj[1] * vx + proj[5] * vy + proj[9] * vz + proj[13]) / cw;
-			minY = Math.min(minY, ndcY);
-			maxY = Math.max(maxY, ndcY);
-		}
-		if (!Number.isFinite(minY)) {
-			break;
-		}
-		const deltaNdc = desiredCenter - (minY + maxY) / 2;
-		if (Math.abs(deltaNdc) < 0.01) {
-			break;
-		}
-		// Lowering the target lifts the scene; ~0.6 radius per NDC unit lands close and the
-		// loop mops up the rest
-		const t = camera.target;
-		camera.target = new Vector3(t.x, t.y - deltaNdc * 0.6 * camera.radius, t.z);
-	}
+	viewer?.frameToContent(isEmbedded.value);
 }
 
 function onKeyUp(e: KeyboardEvent) {
@@ -1022,69 +847,108 @@ function onWindowResize() {
 	nextTick(() => resize());
 }
 
+// DWC's colorMode is 0=tool/color, 1=feedrate, 2=feature; the fork's renderMode is 0=feature,
+// 1=tool, 2=feedrate - these are NOT interchangeable, a silent numeric passthrough would be wrong
+function mapColorModeToRenderMode(mode: number): number {
+	switch (mode) {
+		case 0: return 1; // tool/color
+		case 1: return 2; // feedrate
+		case 2: return 0; // feature
+		default: return 0;
+	}
+}
+
+// The old viewer tracked forceWireMode and useHighQualityExtrusion as independent booleans; the
+// fork collapses box/high-quality-cylinder/wire into a single tri-state mesh mode, so wire mode
+// (if set) wins over high-quality - there's no way to combine them
+function computeMeshMode(forceWireMode: boolean, useHQRendering: boolean): number {
+	if (forceWireMode) {
+		return 2;
+	}
+	return useHQRendering ? 1 : 0;
+}
+
 onMounted(async () => {
 	if (!viewerCanvas.value) {
 		return;
 	}
-	viewer = new gcodeViewer(viewerCanvas.value);
-	viewer.fileData = "";
-	await viewer.init();
+	viewer = new Viewer_Proxy(viewerCanvas.value);
 
-	viewer.simulationMultiplier = 1;
-	viewer.buildObjects.objectCallback = (selected: ObjectInfo) => {
-		objectDialogData.showDialog = true;
-		objectDialogData.info = selected;
+	// The fork has no getters for any viewer-side state - unlike the old package, which was read
+	// back to seed these refs, everything below is instead pushed FROM this component's own
+	// (already-declared) defaults INTO the viewer, so behavior doesn't depend on the fork's
+	// internal defaults matching what this UI assumes.
+	viewer.passThru = (e: any) => {
+		switch (e.type) {
+			case "objectSelected":
+				objectDialogData.showDialog = true;
+				objectDialogData.info = e.object;
+				break;
+			case "objectLabel":
+				hoverLabel.value = showObjectSelection.value ? e.name : "";
+				break;
+			case "progress":
+				loadingProgress.value = Math.ceil(e.progress * 100);
+				loadingMessage.value = e.label ?? "";
+				break;
+			case "animationStopped":
+				scrubPlaying.value = false;
+				break;
+			// TODO(Phase 5b): wire 'animationPositionUpdate' to scrubPosition once live
+			// machine-position nozzle tracking replaces/supplements file-position tracking here
+		}
 	};
-	viewer.buildObjects.labelCallback = (label: string) => {
-		hoverLabel.value = showObjectSelection.value ? label : "";
-	};
-	showObjectLabels.value = viewer.buildObjects.showLabel;
 
+	viewer.init();
+
+	// Rust/WASM parsing fast path - falls back to the pure-TypeScript parser automatically if the
+	// .wasm asset fails to load/instantiate under DWC's bundling/CSP (never verified in a real
+	// consumer app until now), so a failure here is expected-and-handled, not fatal to the mount.
+	try {
+		await viewer.enableWasmProcessing();
+	} catch (error) {
+		console.warn("GCodeViewer: WASM fast path unavailable, using TypeScript parser", error);
+	}
+
+	const axisRange: Partial<Record<"x" | "y" | "z", { min: number; max: number }>> = {};
 	for (const axis of move.value.axes) {
 		if ("XYZ".includes(axis.letter)) {
-			const letter = axis.letter.toLowerCase() as "x" | "y" | "z";
-			viewer.bed.buildVolume[letter].min = axis.min;
-			viewer.bed.buildVolume[letter].max = axis.max;
+			axisRange[axis.letter.toLowerCase() as "x" | "y" | "z"] = { min: axis.min, max: axis.max };
 		}
 	}
-	viewer.bed.commitBedSize();
-
-	cameraInertia.value = viewer.cameraInertia;
-	viewer.bed.setDelta(isDelta.value);
-	bedRenderMode.value = viewer.bed.renderMode;
-	bedColor.value = viewer.bed.getBedColor();
-	showAxes.value = viewer.axes.visible;
-	viewer.gcodeProcessor.useSpecularColor(specular.value);
-
-	colorMode.value = viewer.gcodeProcessor.colorMode;
-	minFeedColor.value = viewer.gcodeProcessor.minFeedColorString;
-	maxFeedColor.value = viewer.gcodeProcessor.maxFeedColorString;
-	minColorRate.value = viewer.gcodeProcessor.minColorRate / 60;
-	maxColorRate.value = viewer.gcodeProcessor.maxColorRate / 60;
-	forceWireMode.value = viewer.gcodeProcessor.forceWireMode;
-	if (viewer.lastLoadFailed()) {
-		renderQuality.value = 1;
-		viewer.updateRenderQuality(1);
-		uiStore.makeNotification(LogLevel.warning,
-			i18n.global.t("plugins.gcodeViewer.caption"),
-			i18n.global.t("plugins.gcodeViewer.renderFailed"), 5000);
-		viewer.clearLoadFlag();
+	if (axisRange.x && axisRange.y && axisRange.z) {
+		viewer.setBuildVolume({ x: axisRange.x, y: axisRange.y, z: axisRange.z });
 	}
-	viewer.setCursorVisiblity(showCursor.value);
-	renderQuality.value = viewer.renderQuality;
-	backgroundColor.value = viewer.getBackgroundColor();
-	progressColor.value = viewer.getProgressColor();
-	viewer.gcodeProcessor.useHighQualityExtrusion(useHQRendering.value);
-	viewer.gcodeProcessor.loadingProgressCallback = (progress: number, message: string | undefined) => {
-		loadingProgress.value = Math.ceil(progress * 100);
-		loadingMessage.value = message ?? "";
-	};
-	viewer.simulationUpdatePosition = (position: number) => {
-		scrubPosition.value = position - 2;
-	};
-	viewer.simulationStopped = () => {
-		scrubPlaying.value = false;
-	};
+
+	viewer.setDeltaBed(isDelta.value);
+	viewer.setBedRenderMode(bedRenderMode.value);
+	viewer.setBedColor(bedColor.value);
+	viewer.showAxes(showAxes.value);
+	viewer.showObjectLabels(showObjectLabels.value);
+	viewer.setCameraInertia(cameraInertia.value);
+	viewer.setBackgroundColor(backgroundColor.value);
+	viewer.setProgressColor(progressColor.value);
+	viewer.setRenderMode(mapColorModeToRenderMode(colorMode.value));
+	viewer.setMeshMode(computeMeshMode(forceWireMode.value, useHQRendering.value));
+	viewer.setMaxFPS(maxFps.value);
+	viewer.setAlphaMode(vertexAlpha.value);
+	viewer.setProgressMode(progressMode.value);
+	viewer.setPerimeterOnly(perimeterOnly.value);
+	viewer.setZBelt(zBelt.value, zBeltAngle.value);
+	viewer.setG1AsExtrusion(g1AsExtrusion.value);
+	// "Cursor" visibility's exact old meaning is unverified (no source for the old package was
+	// available) - mapping to the nozzle/tool-position marker as the closest analog. Revisit if
+	// this turns out to mean something else once compared side-by-side with the old viewer.
+	viewer.toggleNozzle(showCursor.value);
+	viewer.setShowTravels(showTravelLines.value);
+	viewer.setPersistTravels(persistTravels.value);
+	viewer.setFeedColors(minFeedColor.value, maxFeedColor.value);
+	// The slider labels are mm/s (matching the F-command convention shown elsewhere in DWC) but
+	// the fork/G-code feed rates are mm/min, hence the *60 conversion
+	viewer.setFeedRateRange(minColorRate.value * 60, maxColorRate.value * 60);
+	viewer.showWorkplace(showWorkplace.value);
+	viewer.setTransparency(transparencyPercent.value);
+	viewer.setUseSpecular(specular.value);
 
 	nextTick(() => {
 		updateTools();
@@ -1117,6 +981,9 @@ onBeforeUnmount(() => {
 	if (resizeDebounce) {
 		clearTimeout(resizeDebounce);
 	}
+	// Must be called before dropping the reference, or the worker (and everything it owns -
+	// Babylon engine, WASM instance) leaks for the lifetime of the page
+	viewer?.unload();
 	viewer = null;
 });
 
@@ -1127,26 +994,25 @@ function simulatePlay() {
 	if (!viewer) {
 		return;
 	}
+	// scrubPlaying already reflects the fork's actual state: it flips true here, and back to
+	// false either here (pausing) or via the 'animationStopped' passThru event (finished/aborted)
 	if (scrubPlaying.value) {
-		viewer.stopSimulation();
+		viewer.stopNozzleAnimation();
+		scrubPlaying.value = false;
 	} else {
-		viewer.startSimulation();
+		viewer.startNozzleAnimation();
+		scrubPlaying.value = true;
 	}
-	scrubPlaying.value = viewer.simulation;
 }
 
 function scrubPositionChanged(value: number) {
 	if (!viewer) {
 		return;
 	}
-	const viewerState = viewer.simulation;
-	viewer.simulation = false;
-	nextTick(() => {
-		scrubPosition.value = value;
-		viewer.gcodeProcessor.updateFilePosition(value);
-		viewer.simulateToolPosition();
-		viewer.simulation = viewerState;
-	});
+	scrubPosition.value = value;
+	// animate: false - jump straight to this position; the fork resumes any in-progress
+	// animation from here automatically if it was already playing
+	viewer.updateFilePosition(value, false);
 }
 
 function updateColor(index: number, value: string) {
@@ -1155,13 +1021,12 @@ function updateColor(index: number, value: string) {
 	}
 	const next = toolColors.value.slice();
 	next[index] = value;
-	viewer.gcodeProcessor.updateTool(value, 0.4, index);
+	viewer.setTools(next.map((color) => ({ color, diameter: 0.4 })));
 	if (colorDebounce) {
 		clearTimeout(colorDebounce);
 	}
 	colorDebounce = setTimeout(() => {
 		cacheStore.setPluginData("GCodeViewer", "toolColors", next);
-		viewer?.gcodeProcessor.forceRedraw();
 	}, 200);
 }
 
@@ -1176,16 +1041,18 @@ function updateProgressColor(value: string) {
 }
 
 function updateMinFeedColor(value: string) {
-	viewer?.gcodeProcessor.updateMinFeedColor(value);
+	minFeedColor.value = value;
+	viewer?.setFeedColors(value, maxFeedColor.value);
 }
 
 function updateMaxFeedColor(value: string) {
-	viewer?.gcodeProcessor.updateMaxFeedColor(value);
+	maxFeedColor.value = value;
+	viewer?.setFeedColors(minFeedColor.value, value);
 }
 
 function updateBedColor(value: string) {
 	bedColor.value = value;
-	viewer?.bed.setBedColor(value);
+	viewer?.setBedColor(value);
 }
 
 function resize() {
@@ -1232,40 +1099,41 @@ async function loadRunningJob(live = true) {
 	if (!viewer || !job.value.file) {
 		return;
 	}
-	viewer.simulation = false;
+	viewer.stopNozzleAnimation();
+	scrubPlaying.value = false;
 	if (selectedFile.value !== job.value.file.fileName) {
 		selectedFile.value = "";
-		viewer.gcodeProcessor.setLiveTracking(false);
-		viewer.clearScene(true);
+		await viewer.clear();
 	}
 	selectedFile.value = job.value.file.fileName;
 	followingJob.value = live;
 
 	try {
-		const blob = await machineStore.download({
+		const fileText = await machineStore.download({
 			filename: job.value.file.fileName,
 			type: "text",
 		}, false, false, false);
 		loading.value = true;
-		viewer.gcodeProcessor.setLiveTracking(live);
-		viewer.gcodeProcessor.updateForceWireMode(forceWireMode.value);
-		viewer.gcodeProcessor.useHighQualityExtrusion(useHQRendering.value);
 		preLoadSettings();
-		await viewer.processFile(blob);
-		if (viewGCode.value) {
-			fileData.value = viewer.fileData;
+		const result = await viewer.loadFile(fileText);
+		if (result.failed) {
+			uiStore.makeNotification(LogLevel.warning,
+				i18n.global.t("plugins.gcodeViewer.caption"),
+				i18n.global.t("plugins.gcodeViewer.renderFailed"), 5000);
 		}
-		scrubFileSize.value = viewer.fileSize;
-		setGCodeValues();
+		fileData.value = fileText;
+		scrubFileSize.value = result.end;
+		setGCodeValues(result);
 		applyDefaultOrientation();
-		viewer.buildObjects.loadObjectBoundaries(job.value.build?.objects ?? []);
+		viewer.loadObjectBoundaries(job.value.build?.objects ?? []);
 	} finally {
+		// The fork has no dedicated "live tracking" mode - it just reflects whatever file
+		// position was last pushed, so "finished" here just means jumping to the very end
 		if (live) {
-			viewer.gcodeProcessor.updateFilePosition(0);
+			viewer.updateFilePosition(0);
 		} else {
-			viewer.gcodeProcessor.doFinalPass();
+			showCompletedPrint();
 		}
-		viewer.gcodeProcessor.forceRedraw();
 		loading.value = false;
 	}
 }
@@ -1273,7 +1141,6 @@ async function loadRunningJob(live = true) {
 function resetExtruderColors() {
 	toolColors.value = ["#00FFFF", "#FF00FF", "#FFFF00", "#000000", "#FFFFFF"];
 	updateTools();
-	viewer?.gcodeProcessor.forceRedraw();
 }
 
 async function reloadviewer() {
@@ -1282,40 +1149,31 @@ async function reloadviewer() {
 	}
 	loading.value = true;
 	preLoadSettings();
-	if (viewer.fileData.length > 0) {
-		await viewer.reload();
+	if (fileData.value.length > 0 || selectedFile.value.length > 0) {
+		const result = await viewer.reload();
+		setGCodeValues(result);
 	}
 	loading.value = false;
 
-	viewer.setCursorVisiblity(showCursor.value);
-	viewer.toggleTravels(showTravelLines.value);
-	setGCodeValues();
-	viewer.gcodeProcessor.forceRedraw();
-	viewer.gcodeProcessor.updateFilePosition(scrubPosition.value);
+	viewer.toggleNozzle(showCursor.value);
+	viewer.updateFilePosition(scrubPosition.value);
 
-	try {
-		viewer.buildObjects.loadObjectBoundaries(job.value.build?.objects ?? []);
-	} catch {
-		// No build objects - benign
-	}
+	viewer.loadObjectBoundaries(job.value.build?.objects ?? []);
 }
 
 function clearScene() {
 	selectedFile.value = "";
-	viewer?.clearScene(true);
+	viewer?.clear();
 }
 
-// Reveal the whole file once live tracking ends. doFinalPass() only flips the processor's internal
-// flag - it never pushes the file position to the render instances, which clip geometry purely by
-// their last currentFilePosition. When a job ends the object model can reset job.filePosition to 0
-// in a patch that arrives while followingJob is still true, clipping the finished print away to
-// nothing; pushing the end position back in restores it
+// Reveal the whole file once live tracking ends by jumping to the very end file position - the
+// fork clips rendered geometry purely by the last position pushed to it, so there's no separate
+// "finalize" step needed (unlike the old viewer's doFinalPass(), which this replaces).
 function showCompletedPrint() {
 	if (!viewer) {
 		return;
 	}
-	viewer.gcodeProcessor.updateFilePosition(Number.MAX_VALUE);
-	viewer.gcodeProcessor.doFinalPass();
+	viewer.updateFilePosition(Number.MAX_VALUE);
 }
 
 async function objectDialogCancelObject() {
@@ -1331,20 +1189,17 @@ function chooseFile() {
 	}
 }
 
-function setGCodeValues() {
-	if (!viewer) {
-		return;
-	}
+function setGCodeValues(result: LoadFileResult) {
 	if (!g1AsExtrusion.value) {
-		maxHeight.value = zBelt.value ? 500 : viewer.getMaxHeight();
-		minHeight.value = viewer.getMinHeight();
+		maxHeight.value = zBelt.value ? 500 : result.maxHeight;
+		minHeight.value = result.minHeight;
 	} else {
 		maxHeight.value = 100000;
 		minHeight.value = -100000;
 	}
 	sliderHeight.value = maxHeight.value;
 	loading.value = false;
-	maxFileFeedRate.value = viewer.gcodeProcessor.maxFeedRate;
+	maxFileFeedRate.value = result.maxFeedRate;
 	sliderBottomHeight.value = minHeight.value < 0 ? minHeight.value : 0;
 }
 
@@ -1352,33 +1207,30 @@ function preLoadSettings() {
 	if (!viewer) {
 		return;
 	}
-	viewer.gcodeProcessor.updateForceWireMode(forceWireMode.value);
-	viewer.gcodeProcessor.setLiveTracking(followingJob.value);
-	viewer.gcodeProcessor.useHighQualityExtrusion(useHQRendering.value);
-	viewer.gcodeProcessor.perimeterOnly = perimeterOnly.value;
-	viewer.gcodeProcessor.currentWorkplace = currentWorkplace.value;
-	viewer.gcodeProcessor.progressMode = progressMode.value;
-	viewer.gcodeProcessor.persistTravels = persistTravels.value;
+	viewer.setMeshMode(computeMeshMode(forceWireMode.value, useHQRendering.value));
+	viewer.setPerimeterOnly(perimeterOnly.value);
+	viewer.setProgressMode(progressMode.value);
 	viewer.setZBelt(zBelt.value, zBeltAngle.value);
-	if (g1AsExtrusion.value) {
-		renderQuality.value = 5;
-		viewer.updateRenderQuality(5);
-		viewer.gcodeProcessor.g1AsExtrusion = true;
-		viewer.setZClipPlane(10000000, -10000000);
-	}
+	viewer.setG1AsExtrusion(g1AsExtrusion.value);
 }
 
 async function fileSelected(e: Event) {
 	const reader = new FileReader();
 	reader.addEventListener("load", async (event) => {
-		preLoadSettings();
-		const blob = event.target!.result;
-		await viewer?.processFile(blob);
-		if (viewGCode.value && viewer) {
-			fileData.value = viewer.fileData;
+		if (!viewer) {
+			return;
 		}
-		scrubFileSize.value = viewer?.fileSize ?? 0;
-		setGCodeValues();
+		preLoadSettings();
+		const text = event.target!.result as string;
+		const result = await viewer.loadFile(text);
+		if (result.failed) {
+			uiStore.makeNotification(LogLevel.warning,
+				i18n.global.t("plugins.gcodeViewer.caption"),
+				i18n.global.t("plugins.gcodeViewer.renderFailed"), 5000);
+		}
+		fileData.value = text;
+		scrubFileSize.value = result.end;
+		setGCodeValues(result);
 		applyDefaultOrientation();
 	});
 	loading.value = true;
@@ -1395,80 +1247,86 @@ function toggleFullScreen() {
 }
 
 function cancelLoad() {
-	if (viewer) {
-		viewer.gcodeProcessor.cancelLoad = true;
-	}
+	viewer?.cancelLoad();
 }
 
 function fastForward() {
 	if (!viewer) {
 		return;
 	}
-	viewer.stopSimulation();
+	viewer.stopNozzleAnimation();
 	scrubPlaying.value = false;
 	scrubPosition.value = scrubFileSize.value;
-	viewer.gcodeProcessor.updateFilePosition(scrubFileSize.value);
+	viewer.updateFilePosition(scrubFileSize.value);
 }
 
+// Builds the fork's expected { x, y, z }[] (one entry per G54-G59.3 workplace) from the object
+// model, which instead exposes offsets per-axis (axis.workplaceOffsets[workplaceIndex])
 function updateWorkplaces() {
 	if (!viewer) {
 		return;
 	}
-	const axesLetterIdx: Record<string, number> = {};
-	for (let i = 0; i < move.value.axes.length; i++) {
-		axesLetterIdx[move.value.axes[i].letter] = i;
-	}
-	viewer.gcodeProcessor.workplaceOffsets = [];
-	for (let idx = 0; idx < 9; idx++) {
-		try {
-			const x = move.value.axes[axesLetterIdx["X"]].workplaceOffsets[idx];
-			const y = move.value.axes[axesLetterIdx["Y"]].workplaceOffsets[idx];
-			const z = move.value.axes[axesLetterIdx["Z"]].workplaceOffsets[idx];
-			viewer.gcodeProcessor.workplaceOffsets.push(new Vector3(x, y, z));
-		} catch {
-			// Axis not yet defined - skip this workplace slot
+	const offsets: { x: number; y: number; z: number }[] = [];
+	for (const axis of move.value.axes) {
+		if (!"XYZ".includes(axis.letter)) {
+			continue;
 		}
+		const letter = axis.letter.toLowerCase() as "x" | "y" | "z";
+		axis.workplaceOffsets.forEach((offset, idx) => {
+			if (!offsets[idx]) {
+				offsets[idx] = { x: 0, y: 0, z: 0 };
+			}
+			offsets[idx][letter] = offset;
+		});
 	}
-	viewer.setWorkplaceVisiblity(showWorkplace.value);
+	if (offsets.length > 0) {
+		viewer.setWorkplaceOffsets(offsets);
+	}
+	viewer.setCurrentWorkplaceIndex(currentWorkplace.value);
 }
 
 function updateTools() {
 	if (!viewer) {
 		return;
 	}
-	viewer.gcodeProcessor.resetTools();
-	for (const color of toolColors.value) {
-		viewer.gcodeProcessor.addTool(color, 0.4);
-	}
+	viewer.setTools(toolColors.value.map((color) => ({ color, diameter: 0.4 })));
 }
 
 // #endregion
 
 // #region Watches
-watch(move, (newValue) => {
-	if (!viewer) {
+// Live machine-position nozzle tracking - only while the cursor/nozzle marker is visible and the
+// viewer isn't already being driven by a followed job's file-position (see the filePosition watch
+// below), which owns the nozzle while it's active
+watch(move, () => {
+	if (!viewer || !showCursor.value || followingJob.value) {
 		return;
 	}
-	const newPosition = newValue.axes.map((axis: Axis) => ({
-		axes: axis.letter,
-		position: (axis.userPosition ?? 0) + axis.workplaceOffsets[currentWorkplace.value],
-	}));
-	viewer.updateToolPosition(newPosition);
+	const position: Partial<Record<"x" | "y" | "z", number>> = {};
+	for (const axis of move.value.axes) {
+		if ("XYZ".includes(axis.letter) && axis.machinePosition !== null) {
+			position[axis.letter.toLowerCase() as "x" | "y" | "z"] = axis.machinePosition;
+		}
+	}
+	if (position.x !== undefined && position.y !== undefined && position.z !== undefined) {
+		viewer.setNozzlePosition({ x: position.x, y: position.y, z: position.z });
+	}
 }, { deep: true });
 
 watch(showCursor, (newValue) => {
-	viewer?.setCursorVisiblity(newValue);
+	// "Cursor" visibility's exact old meaning is unverified - mapped to the nozzle/tool-position
+	// marker as the closest analog (see onMounted and the plan doc)
+	viewer?.toggleNozzle(newValue);
 });
 
-watch(showTravelLines, (newValue) => viewer?.toggleTravels(newValue));
-
+watch(showTravelLines, (newValue) => viewer?.setShowTravels(newValue));
 watch(persistTravels, (newValue) => {
-	showTravelLines.value = true;
-	if (!viewer) {
-		return;
+	viewer?.setPersistTravels(newValue);
+	// Persisting travels implies showing them - only force the switch on, never off, so turning
+	// persistTravels back off doesn't also hide travels the user separately enabled
+	if (newValue) {
+		showTravelLines.value = true;
 	}
-	viewer.gcodeProcessor.setTravelPersistence(newValue);
-	viewer.gcodeProcessor.forceRedraw();
 });
 
 watch(visualizingCurrentJob, (newValue) => {
@@ -1481,24 +1339,11 @@ watch(visualizingCurrentJob, (newValue) => {
 watch(filePosition, (newValue) => {
 	if (followingJob.value) {
 		scrubPosition.value = newValue;
-		viewer?.gcodeProcessor.updateFilePosition(newValue + 1);
+		viewer?.updateFilePosition(newValue + 1);
 	}
 });
 
-watch(scrubSpeed, (to) => {
-	if (viewer) {
-		viewer.simulationMultiplier = to;
-	}
-});
-
-watch(renderQuality, (newValue) => {
-	if (viewer && viewer.renderQuality !== newValue) {
-		viewer.updateRenderQuality(newValue);
-		if (!loading.value) {
-			reloadviewer();
-		}
-	}
-});
+watch(scrubSpeed, (to) => viewer?.setNozzleAnimationSpeed(to));
 
 watch(sliderHeight, (newValue) => {
 	if (sliderBottomHeight.value > newValue) {
@@ -1518,17 +1363,13 @@ watch(sliderBottomHeight, (newValue) => {
 	}
 });
 
-watch(vertexAlpha, (newValue) => {
-	if (!viewer) {
-		return;
-	}
-	viewer.gcodeProcessor.setAlpha(newValue);
-	reloadviewer();
-});
+// vertexAlpha ("transparency" checkbox) is a boolean ghosting toggle - matches the fork's
+// setAlphaMode(bool) directly, and (unlike the old package) needs no reparse to take effect
+watch(vertexAlpha, (newValue) => viewer?.setAlphaMode(newValue));
 
 watch(() => job.value.build?.objects, (newValue) => {
-	if (viewer?.buildObjects && newValue) {
-		viewer.buildObjects.loadObjectBoundaries(newValue);
+	if (viewer && newValue) {
+		viewer.loadObjectBoundaries(newValue);
 	}
 }, { deep: true });
 
@@ -1537,8 +1378,8 @@ watch(showObjectSelection, (newValue) => {
 		return;
 	}
 	if (canCancelObject.value) {
-		viewer.buildObjects.loadObjectBoundaries(job.value.build?.objects ?? []);
-		viewer.buildObjects.showObjectSelection(newValue);
+		viewer.loadObjectBoundaries(job.value.build?.objects ?? []);
+		viewer.showObjectSelection(newValue);
 	} else {
 		showObjectSelection.value = false;
 		hoverLabel.value = "";
@@ -1546,48 +1387,39 @@ watch(showObjectSelection, (newValue) => {
 });
 
 watch(isJobRunning, (newValue) => {
-	if (!viewer) {
-		return;
-	}
 	if (!newValue) {
 		followingJob.value = false;
 		showCompletedPrint();
 	}
-	viewer.gcodeProcessor.setLiveTracking(followingJob.value);
 });
 
 watch(selectedFile, () => {
 	showObjectSelection.value = false;
-	viewer?.gcodeProcessor.updateFilePosition(0);
+	viewer?.updateFilePosition(0);
 });
 
-watch(bedRenderMode, (newValue) => viewer?.bed.setRenderMode(newValue));
+watch(bedRenderMode, (newValue) => viewer?.setBedRenderMode(newValue));
 
 watch(isDelta, (newValue) => {
-	viewer?.bed.setDelta(newValue);
+	viewer?.setDeltaBed(newValue);
 	viewer?.resetCamera();
 });
 
-watch(showAxes, (newValue) => viewer?.axes.show(newValue));
-watch(showObjectLabels, (newValue) => viewer?.buildObjects.showLabels(newValue));
+watch(showAxes, (newValue) => viewer?.showAxes(newValue));
+watch(showObjectLabels, (newValue) => viewer?.showObjectLabels(newValue));
 
-watch(forceWireMode, (newValue) => {
-	viewer?.gcodeProcessor.updateForceWireMode(newValue);
-	reloadviewer();
-});
+// Mesh mode is a cheap, instant toggle in the fork (no reparse needed, unlike the old package)
+watch(forceWireMode, (newValue) => viewer?.setMeshMode(computeMeshMode(newValue, useHQRendering.value)));
+watch(useHQRendering, (newValue) => viewer?.setMeshMode(computeMeshMode(forceWireMode.value, newValue)));
+watch(maxFps, (to) => viewer?.setMaxFPS(to));
 
-watch(useHQRendering, (to) => viewer?.gcodeProcessor.useHighQualityExtrusion(to));
+// Render mode is also a cheap per-frame uniform switch in the fork - no reparse needed
+watch(colorMode, (to) => viewer?.setRenderMode(mapColorModeToRenderMode(to)));
 
-watch(colorMode, async (to) => {
-	if (!viewer) {
-		return;
-	}
-	viewer.gcodeProcessor.setColorMode(to);
-	await reloadviewer();
-});
+// mm/s -> mm/min, see the matching conversion in onMounted
+watch(minColorRate, (to) => viewer?.setFeedRateRange(to * 60, maxColorRate.value * 60));
+watch(maxColorRate, (to) => viewer?.setFeedRateRange(minColorRate.value * 60, to * 60));
 
-watch(minColorRate, (to) => viewer?.gcodeProcessor.updateColorRate(to * 60, maxColorRate.value * 60));
-watch(maxColorRate, (to) => viewer?.gcodeProcessor.updateColorRate(minColorRate.value * 60, to * 60));
 watch(cameraInertia, (to) => viewer?.setCameraInertia(to));
 
 watch(loading, (to) => {
@@ -1596,47 +1428,40 @@ watch(loading, (to) => {
 	}
 });
 
-watch(specular, (to) => viewer?.gcodeProcessor.useSpecularColor(to));
+watch(specular, (to) => viewer?.setUseSpecular(to));
 
+// CNC mode (treat every G1 as an extrusion) is also a parse-time setting - a reload is required
+// for a change to actually take effect, same as zBelt below
 watch(g1AsExtrusion, async (to) => {
-	if (!viewer) {
-		return;
-	}
-	viewer.gcodeProcessor.g1AsExtrusion = to;
+	viewer?.setG1AsExtrusion(to);
 	await reloadviewer();
 });
 
-watch(zBelt, (to) => viewer?.setZBelt(to, zBeltAngle.value));
+// zBelt/gantry-angle are parse-time settings in the fork (unlike the old package, which appears
+// to apply them live) - a reload is required for a change to actually take visual effect
+watch(zBelt, async (to) => {
+	viewer?.setZBelt(to, zBeltAngle.value);
+	await reloadviewer();
+});
 
-watch(zBeltAngle, (to) => {
+watch(zBeltAngle, async (to) => {
 	if (to < 0 || to > 90) {
 		cacheStore.setPluginData("GCodeViewer", "zBeltAngle", 45);
 		return;
 	}
 	viewer?.setZBelt(zBelt.value, to);
+	await reloadviewer();
 });
 
-watch(workplaceOffsets, () => updateWorkplaces(), { deep: true });
-watch(currentWorkplace, (to) => {
-	if (viewer) {
-		viewer.gcodeProcessor.currentWorkplace = to;
-	}
-});
-watch(showWorkplace, () => updateWorkplaces());
+watch(workplaceOffsets, updateWorkplaces, { deep: true });
+watch(currentWorkplace, (to) => viewer?.setCurrentWorkplaceIndex(to));
+watch(showWorkplace, (to) => viewer?.showWorkplace(to));
 
 watch(toolColors, () => updateTools(), { deep: true });
 
-watch(transparencyPercent, (to) => {
-	if (!viewer) {
-		return;
-	}
-	viewer.gcodeProcessor.setTransparencyValue(to / 100);
-	viewer.gcodeProcessor.forceRedraw();
-});
+watch(transparencyPercent, (to) => viewer?.setTransparency(to));
 
-watch(progressMode, async () => {
-	await reloadviewer();
-});
+watch(progressMode, (to) => viewer?.setProgressMode(to));
 
 // #endregion
 </script>

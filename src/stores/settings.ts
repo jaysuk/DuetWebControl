@@ -242,6 +242,7 @@ export const useSettingsStore = defineStore("settings", {
 		 */
 		enabledPlugins: [
 			"GCodeViewer",
+			"GCodeViewerForkTest", // TEMP: gcodeviewer fork smoke test - remove with the plugin folder
 			"HeightMap",
 			"InputShaping",
 			"ObjectModelBrowser",
