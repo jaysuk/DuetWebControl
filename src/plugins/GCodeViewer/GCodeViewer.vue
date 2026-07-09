@@ -85,6 +85,9 @@
 	inset: 0;
 	background-color: rgba(0, 0, 0, 0.4);
 	z-index: 30;
+	/* Purely a visual dim behind the slide-in panel now - must not catch clicks, or every 3D-view
+	   interaction (orientation gizmo, orbit-drag, pick-focus) silently dies while the panel is open */
+	pointer-events: none;
 }
 
 .gcv-settings-panel {
@@ -249,7 +252,11 @@
 				 `position: absolute; inset: 0` so the panel stays within the viewer card and
 				 doesn't bleed over the status panel above. Fullscreen mode: viewer-box becomes
 				 `position: fixed; inset: 0` and the panel covers the viewport with it -->
-			<div v-if="drawer" class="gcv-settings-backdrop" @click="drawer = false" />
+			<!-- No click-to-close: this used to catch clicks anywhere outside the 350px panel to
+				 close it, but that meant it silently intercepted every click meant for the 3D
+				 view underneath (the orientation gizmo, orbit-drag, pick-focus) any time the
+				 panel was open - the gear icon already toggles the panel unambiguously -->
+			<div v-if="drawer" class="gcv-settings-backdrop" />
 			<Transition name="gcv-settings-slide">
 				<aside v-if="drawer" class="gcv-settings-panel">
 					<v-expansion-panels v-model="openDrawerPanel" variant="accordion">
