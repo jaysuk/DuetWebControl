@@ -970,6 +970,17 @@ onMounted(async () => {
 	// A file deep-linked into the route (Jobs list "View 3D" navigation arrives this way) loads
 	// immediately; at the bare path the viewer falls back to the running job instead
 	loadFromRoute();
+
+	// The only other resize() trigger at this point is viewerClass's computed side effect, which
+	// fires once during the initial render - nextTick only waits for Vue's own DOM patch, not for
+	// the browser to finish layout (other panels/fonts/async content still settling can shift the
+	// canvas after that first read). Without a later resync, the worker's cached canvas position
+	// (see ViewerProxy.resize - it's what converts a pointer event's clientX/clientY into
+	// canvas-relative coordinates) stays wrong for the rest of the page's life, silently breaking
+	// every pointer interaction (orientation gizmo, orbit-drag, pick-focus) until something else
+	// happens to trigger a real resize (e.g. the window itself being resized). One more resync
+	// past the existing 500ms debounce catches that.
+	setTimeout(() => resize(), 800);
 });
 
 // Re-entering the kept-alive page, or navigating to a different file while it stays mounted,
