@@ -1151,12 +1151,23 @@ async function reloadviewer() {
 	preLoadSettings();
 	if (fileData.value.length > 0 || selectedFile.value.length > 0) {
 		const result = await viewer.reload();
+		scrubFileSize.value = result.end;
 		setGCodeValues(result);
 	}
 	loading.value = false;
 
 	viewer.toggleNozzle(showCursor.value);
-	viewer.updateFilePosition(scrubPosition.value);
+	// scrubPosition only reflects a real "where the user was scrubbing to" value while actively
+	// following a live job - otherwise (a manually loaded/completed file) it was never advanced
+	// past its 0 default, so pushing it here would hide the whole reloaded model behind the
+	// shader's "not yet printed" discard. Match loadRunningJob(false)'s pattern instead: show the
+	// complete model.
+	if (followingJob.value) {
+		viewer.updateFilePosition(scrubPosition.value);
+	} else {
+		showCompletedPrint();
+		scrubPosition.value = scrubFileSize.value;
+	}
 
 	viewer.loadObjectBoundaries(job.value.build?.objects ?? []);
 }
@@ -1229,9 +1240,12 @@ async function fileSelected(e: Event) {
 				i18n.global.t("plugins.gcodeViewer.renderFailed"), 5000);
 		}
 		fileData.value = text;
+		followingJob.value = false;
 		scrubFileSize.value = result.end;
 		setGCodeValues(result);
 		applyDefaultOrientation();
+		showCompletedPrint();
+		scrubPosition.value = scrubFileSize.value;
 	});
 	loading.value = true;
 	const input = e.target as HTMLInputElement;
@@ -1434,6 +1448,14 @@ watch(specular, (to) => viewer?.setUseSpecular(to));
 // for a change to actually take effect, same as zBelt below
 watch(g1AsExtrusion, async (to) => {
 	viewer?.setG1AsExtrusion(to);
+	await reloadviewer();
+});
+
+// perimeterOnly is also a build-time filter (which segments get built into the mesh at all), not
+// an instant shader toggle - previously had no watcher at all, so the checkbox did nothing until
+// some unrelated setting change happened to trigger a reload
+watch(perimeterOnly, async (to) => {
+	viewer?.setPerimeterOnly(to);
 	await reloadviewer();
 });
 
