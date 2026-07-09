@@ -13,14 +13,22 @@ export async function runViewboxTest(): Promise<void> {
 	viewer.init();
 	await viewer.enableWasmProcessing().catch(() => {});
 
-	const gcode = [
-		"G28", "G90",
-		"G1 X10 Y10 Z0.2 F1500",
-		"G1 X30 Y10 E1 F1200",
-		"G1 X30 Y30 E2",
-		"G1 X10 Y30 E3",
-		"G1 X10 Y10 E4",
-	].join("\n");
+	const lines = ["G28", "G90"];
+	let e = 0;
+	for (let layer = 0; layer < 40; layer++) {
+		const z = (0.2 + layer * 0.2).toFixed(2);
+		lines.push(`G1 Z${z} F600`);
+		lines.push(`G1 X10 Y10 F3000`);
+		e += 1;
+		lines.push(`G1 X30 Y10 E${e} F1200`);
+		e += 1;
+		lines.push(`G1 X30 Y30 E${e}`);
+		e += 1;
+		lines.push(`G1 X10 Y30 E${e}`);
+		e += 1;
+		lines.push(`G1 X10 Y10 E${e}`);
+	}
+	const gcode = lines.join("\n");
 	await viewer.loadFile(gcode);
 	viewer.frameToContent(false);
 	await new Promise((r) => setTimeout(r, 500));
