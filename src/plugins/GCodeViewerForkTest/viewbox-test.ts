@@ -2,8 +2,8 @@
 export async function runViewboxTest(): Promise<void> {
 	const mod = await import("@duet3d/gcodeviewer");
 	const canvas = document.createElement("canvas");
-	canvas.width = 900;
-	canvas.height = 700;
+	canvas.width = 1800;
+	canvas.height = 1400;
 	canvas.id = "viewbox-test-canvas";
 	document.body.innerHTML = "";
 	document.body.appendChild(canvas);
